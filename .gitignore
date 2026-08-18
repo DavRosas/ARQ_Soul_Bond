@@ -73,3 +73,13 @@ Plugins/**/Intermediate/*
 
 # Cache files for the editor to use
 DerivedDataCache/*
+
+# Per-user Unreal folders (local Collections / sandbox)
+Developers/
+Content/Developers/
+
+# OS and editor temp files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
