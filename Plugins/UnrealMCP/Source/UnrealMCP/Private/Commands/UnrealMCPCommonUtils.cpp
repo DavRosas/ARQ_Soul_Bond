@@ -20,6 +20,10 @@
 #include "Engine/Selection.h"
 #include "EditorAssetLibrary.h"
 #include "AssetRegistry/AssetRegistryModule.h"
+#include "AssetRegistry/IAssetRegistry.h"
+#include "AssetRegistry/AssetData.h"
+#include "AssetRegistry/ARFilter.h"
+#include "Modules/ModuleManager.h"
 #include "Engine/BlueprintGeneratedClass.h"
 #include "BlueprintNodeSpawner.h"
 #include "BlueprintActionDatabase.h"
@@ -173,8 +177,72 @@ UBlueprint* FUnrealMCPCommonUtils::FindBlueprint(const FString& BlueprintName)
 
 UBlueprint* FUnrealMCPCommonUtils::FindBlueprintByName(const FString& BlueprintName)
 {
-    FString AssetPath = TEXT("/Game/Blueprints/") + BlueprintName;
-    return LoadObject<UBlueprint>(nullptr, *AssetPath);
+    if (BlueprintName.IsEmpty())
+    {
+        return nullptr;
+    }
+
+    auto TryLoadBlueprint = [](const FString& PackagePath) -> UBlueprint*
+    {
+        // Invalid names (e.g. concatenated "/Game/Blueprints/" + "/Game/...")
+        // must not reach LoadObject: UE fatals on package names with "//".
+        if (PackagePath.IsEmpty() || PackagePath.Contains(TEXT("//")))
+        {
+            return nullptr;
+        }
+        return LoadObject<UBlueprint>(nullptr, *PackagePath);
+    };
+
+    // Absolute path: use it as-is. Never prefix /Game/Blueprints/.
+    if (BlueprintName.StartsWith(TEXT("/")))
+    {
+        FString PackagePath = BlueprintName;
+        int32 DotIndex = INDEX_NONE;
+        if (PackagePath.FindLastChar(TEXT('.'), DotIndex))
+        {
+            // "/Game/Foo/Bar.Bar" -> "/Game/Foo/Bar"
+            PackagePath.LeftInline(DotIndex);
+        }
+        return TryLoadBlueprint(PackagePath);
+    }
+
+    // Legacy short name: Content/Blueprints/<Name>
+    if (UBlueprint* LegacyBlueprint = TryLoadBlueprint(TEXT("/Game/Blueprints/") + BlueprintName))
+    {
+        return LegacyBlueprint;
+    }
+
+    // Short name not under /Game/Blueprints/: resolve via Asset Registry.
+    FAssetRegistryModule* AssetRegistryModule = FModuleManager::GetModulePtr<FAssetRegistryModule>(TEXT("AssetRegistry"));
+    if (!AssetRegistryModule)
+    {
+        return nullptr;
+    }
+
+    FARFilter Filter;
+    Filter.ClassPaths.Add(UBlueprint::StaticClass()->GetClassPathName());
+    Filter.bRecursiveClasses = true;
+    Filter.PackagePaths.Add(TEXT("/Game"));
+    Filter.bRecursivePaths = true;
+
+    TArray<FAssetData> Assets;
+    AssetRegistryModule->Get().GetAssets(Filter, Assets);
+
+    const FName TargetName(*BlueprintName);
+    for (const FAssetData& AssetData : Assets)
+    {
+        if (AssetData.AssetName != TargetName)
+        {
+            continue;
+        }
+
+        if (UBlueprint* FoundBlueprint = Cast<UBlueprint>(AssetData.GetAsset()))
+        {
+            return FoundBlueprint;
+        }
+    }
+
+    return nullptr;
 }
 
 UEdGraph* FUnrealMCPCommonUtils::FindOrCreateEventGraph(UBlueprint* Blueprint)
