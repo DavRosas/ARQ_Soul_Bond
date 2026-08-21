@@ -444,6 +444,8 @@ bool FUnrealMCPCommonUtils::ConnectGraphNodes(UEdGraph* Graph, UEdGraphNode* Sou
     if (SourcePin && TargetPin)
     {
         SourcePin->MakeLinkTo(TargetPin);
+        SourcePin->GetOwningNode()->PinConnectionListChanged(SourcePin);
+        TargetPin->GetOwningNode()->PinConnectionListChanged(TargetPin);
         return true;
     }
     

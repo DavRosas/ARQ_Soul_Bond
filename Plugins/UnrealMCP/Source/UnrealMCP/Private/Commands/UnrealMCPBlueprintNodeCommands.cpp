@@ -8,13 +8,23 @@
 #include "K2Node_Event.h"
 #include "K2Node_CallFunction.h"
 #include "K2Node_VariableGet.h"
+#include "K2Node_VariableSet.h"
+#include "K2Node_DynamicCast.h"
 #include "K2Node_InputAction.h"
 #include "K2Node_Self.h"
+#include "K2Node_IfThenElse.h"
+#include "K2Node_ExecutionSequence.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/KismetEditorUtilities.h"
 #include "GameFramework/InputSettings.h"
+#include "GameFramework/CharacterMovementComponent.h"
 #include "Camera/CameraActor.h"
 #include "Kismet/GameplayStatics.h"
+#include "Kismet/KismetMathLibrary.h"
+#include "Kismet/KismetSystemLibrary.h"
+#include "Components/BoxComponent.h"
+#include "Components/ActorComponent.h"
+#include "GameFramework/PlayerController.h"
 #include "EdGraphSchema_K2.h"
 
 namespace
@@ -24,7 +34,8 @@ namespace
 // Declare the log category
 DEFINE_LOG_CATEGORY_STATIC(LogUnrealMCP, Log, All);
 
-
+TSharedPtr<FJsonObject> HandleSetupClimbZone(const TSharedPtr<FJsonObject>& Params);
+TSharedPtr<FJsonObject> HandleSetupSimpleClimb(const TSharedPtr<FJsonObject>& Params);
 
 TSharedPtr<FJsonObject> HandleConnectBlueprintNodes(const TSharedPtr<FJsonObject>& Params)
 {
@@ -244,6 +255,12 @@ TSharedPtr<FJsonObject> HandleAddBlueprintFunctionCall(const TSharedPtr<FJsonObj
         return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'function_name' parameter"));
     }
 
+    if (FunctionName == TEXT("SetupClimbZoneGraph") || FunctionName == TEXT("SetupSimpleClimbNow"))
+    {
+        UE_LOG(LogTemp, Display, TEXT("setup_climb_SIMPLE_v2"));
+        return HandleSetupSimpleClimb(Params);
+    }
+
     // Get position parameters (optional)
     FVector2D NodePosition(0.0f, 0.0f);
     if (Params->HasField(TEXT("node_position")))
@@ -420,6 +437,90 @@ TSharedPtr<FJsonObject> HandleAddBlueprintFunctionCall(const TSharedPtr<FJsonObj
     {
         FunctionNode = FUnrealMCPCommonUtils::CreateFunctionCallNode(EventGraph, Function, NodePosition);
     }
+
+    // Property setters / typed casts that are K2 nodes, not UFunctions.
+    if (!Function && !FunctionNode)
+    {
+        auto ParseParamNumber = [](const TSharedPtr<FJsonObject>& AllParams, const FString& Key, FString& OutVal) -> bool
+        {
+            const TSharedPtr<FJsonObject>* ParamsObj = nullptr;
+            if (!AllParams->TryGetObjectField(TEXT("params"), ParamsObj) || !ParamsObj || !(*ParamsObj).IsValid())
+            {
+                return false;
+            }
+            double Num = 0.0;
+            if ((*ParamsObj)->TryGetNumberField(Key, Num) || (*ParamsObj)->TryGetNumberField(TEXT("Value"), Num))
+            {
+                OutVal = FString::SanitizeFloat(Num);
+                return true;
+            }
+            FString AsString;
+            if ((*ParamsObj)->TryGetStringField(Key, AsString) || (*ParamsObj)->TryGetStringField(TEXT("Value"), AsString))
+            {
+                OutVal = AsString;
+                return true;
+            }
+            return false;
+        };
+
+        auto FinishNewNode = [&](UEdGraphNode* NewNode) -> TSharedPtr<FJsonObject>
+        {
+            FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+            TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+            ResultObj->SetStringField(TEXT("node_id"), NewNode->NodeGuid.ToString());
+            return ResultObj;
+        };
+
+        if (FunctionName == TEXT("CastToCharacterMovementComponent"))
+        {
+            UK2Node_DynamicCast* CastNode = NewObject<UK2Node_DynamicCast>(EventGraph);
+            CastNode->TargetType = UCharacterMovementComponent::StaticClass();
+            CastNode->NodePosX = NodePosition.X;
+            CastNode->NodePosY = NodePosition.Y;
+            EventGraph->AddNode(CastNode);
+            CastNode->CreateNewGuid();
+            CastNode->PostPlacedNewNode();
+            CastNode->AllocateDefaultPins();
+            CastNode->SetPurity(true);
+            CastNode->ReconstructNode();
+            return FinishNewNode(CastNode);
+        }
+
+        if (FunctionName == TEXT("SetGravityScale") || FunctionName == TEXT("SetAirControl"))
+        {
+            const FName VarName = (FunctionName == TEXT("SetGravityScale"))
+                ? FName(TEXT("GravityScale"))
+                : FName(TEXT("AirControl"));
+
+            UK2Node_VariableSet* SetNode = NewObject<UK2Node_VariableSet>(EventGraph);
+            SetNode->VariableReference.SetExternalMember(VarName, UCharacterMovementComponent::StaticClass());
+            SetNode->NodePosX = NodePosition.X;
+            SetNode->NodePosY = NodePosition.Y;
+            EventGraph->AddNode(SetNode);
+            SetNode->CreateNewGuid();
+            SetNode->PostPlacedNewNode();
+            SetNode->AllocateDefaultPins();
+            SetNode->ReconstructNode();
+
+            FString DefaultVal;
+            if (ParseParamNumber(Params, VarName.ToString(), DefaultVal))
+            {
+                if (UEdGraphPin* ValuePin = SetNode->FindPin(VarName))
+                {
+                    if (const UEdGraphSchema_K2* K2Schema = Cast<const UEdGraphSchema_K2>(EventGraph->GetSchema()))
+                    {
+                        K2Schema->TrySetDefaultValue(*ValuePin, DefaultVal);
+                    }
+                    else
+                    {
+                        ValuePin->DefaultValue = DefaultVal;
+                    }
+                }
+            }
+
+            return FinishNewNode(SetNode);
+        }
+    }
     
     if (!FunctionNode)
     {
@@ -556,6 +657,18 @@ TSharedPtr<FJsonObject> HandleAddBlueprintFunctionCall(const TSharedPtr<FJsonObj
                                     UE_LOG(LogTemp, Warning, TEXT("Array parameter type not fully supported yet"));
                                 }
                             }
+                        }
+                        else
+                        {
+                            // Name, String, Byte/enum, FKey, and other pin defaults.
+                            // TrySetDefaultValue is required for FKey / Name; raw DefaultValue is not enough.
+                            ParamPin->DefaultValue = StringVal;
+                            if (const UEdGraphSchema_K2* K2Schema = Cast<const UEdGraphSchema_K2>(EventGraph->GetSchema()))
+                            {
+                                K2Schema->TrySetDefaultValue(*ParamPin, StringVal);
+                            }
+                            UE_LOG(LogTemp, Display, TEXT("  Set generic default for '%s' to: '%s' (final '%s')"),
+                                   *ParamName, *StringVal, *ParamPin->DefaultValue);
                         }
                     }
                     else if (ParamValue->Type == EJson::Number)
@@ -887,6 +1000,277 @@ TSharedPtr<FJsonObject> HandleFindBlueprintNodes(const TSharedPtr<FJsonObject>& 
     return ResultObj;
 }
 
+TSharedPtr<FJsonObject> HandleSetupSimpleClimb(const TSharedPtr<FJsonObject>& Params)
+{
+    FString BlueprintName = TEXT("BP_ZonaEscaleraSimple");
+    Params->TryGetStringField(TEXT("blueprint_name"), BlueprintName);
+
+    UBlueprint* Blueprint = FUnrealMCPCommonUtils::FindBlueprint(BlueprintName);
+    if (!Blueprint)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Blueprint not found: %s"), *BlueprintName));
+    }
+
+    UEdGraph* EventGraph = FUnrealMCPCommonUtils::FindOrCreateEventGraph(Blueprint);
+    if (!EventGraph)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to get event graph"));
+    }
+
+    const UEdGraphSchema_K2* Schema = Cast<const UEdGraphSchema_K2>(EventGraph->GetSchema());
+    EventGraph->Modify();
+    Blueprint->Modify();
+
+    TArray<UEdGraphNode*> ExistingNodes = EventGraph->Nodes;
+    for (UEdGraphNode* Node : ExistingNodes)
+    {
+        if (Node)
+        {
+            EventGraph->RemoveNode(Node);
+        }
+    }
+
+    auto FindFn = [](UClass* Class, const TCHAR* Name) -> UFunction*
+    {
+        return Class ? Class->FindFunctionByName(Name) : nullptr;
+    };
+
+    auto AddCall = [&](UClass* Class, const TCHAR* Name, float X, float Y) -> UK2Node_CallFunction*
+    {
+        UFunction* Fn = FindFn(Class, Name);
+        if (!Fn)
+        {
+            UE_LOG(LogTemp, Error, TEXT("setup_climb_zone: missing function %s on %s"), Name, *Class->GetName());
+            return nullptr;
+        }
+        return FUnrealMCPCommonUtils::CreateFunctionCallNode(EventGraph, Fn, FVector2D(X, Y));
+    };
+
+    auto SetDefault = [&](UEdGraphNode* Node, const TCHAR* PinName, const FString& Value)
+    {
+        if (!Node || !Schema)
+        {
+            return;
+        }
+        if (UEdGraphPin* Pin = FUnrealMCPCommonUtils::FindPin(Node, PinName, EGPD_Input))
+        {
+            Schema->TrySetDefaultValue(*Pin, Value);
+            Pin->DefaultValue = Value;
+        }
+    };
+
+    auto SetClassDefault = [&](UEdGraphNode* Node, const TCHAR* PinName, UClass* Class)
+    {
+        if (!Node || !Schema || !Class)
+        {
+            return;
+        }
+        if (UEdGraphPin* Pin = FUnrealMCPCommonUtils::FindPin(Node, PinName, EGPD_Input))
+        {
+            Schema->TrySetDefaultObject(*Pin, Class);
+        }
+    };
+
+    auto Link = [&](UEdGraphNode* Source, const TCHAR* SourcePin, UEdGraphNode* Target, const TCHAR* TargetPin) -> bool
+    {
+        if (!Source || !Target)
+        {
+            return false;
+        }
+        return FUnrealMCPCommonUtils::ConnectGraphNodes(EventGraph, Source, SourcePin, Target, TargetPin);
+    };
+
+    auto AddEvent = [&](const TCHAR* Name, float X, float Y) -> UK2Node_Event*
+    {
+        UK2Node_Event* EventNode = FUnrealMCPCommonUtils::CreateEventNode(EventGraph, Name, FVector2D(X, Y));
+        if (EventNode && !EventNode->NodeGuid.IsValid())
+        {
+            EventNode->CreateNewGuid();
+        }
+        return EventNode;
+    };
+
+    auto AddVarSet = [&](const TCHAR* VarName, const FString& Value, float X, float Y) -> UK2Node_VariableSet*
+    {
+        UK2Node_VariableSet* SetNode = NewObject<UK2Node_VariableSet>(EventGraph);
+        SetNode->VariableReference.SetExternalMember(FName(VarName), UCharacterMovementComponent::StaticClass());
+        SetNode->NodePosX = X;
+        SetNode->NodePosY = Y;
+        EventGraph->AddNode(SetNode);
+        SetNode->CreateNewGuid();
+        SetNode->PostPlacedNewNode();
+        SetNode->AllocateDefaultPins();
+        SetNode->ReconstructNode();
+        SetDefault(SetNode, VarName, Value);
+        return SetNode;
+    };
+
+    UK2Node_Event* BeginOverlap = AddEvent(TEXT("ReceiveActorBeginOverlap"), -600.f, 0.f);
+    UK2Node_Event* Tick = AddEvent(TEXT("ReceiveTick"), -600.f, 700.f);
+    UK2Node_Event* EndOverlap = AddEvent(TEXT("ReceiveActorEndOverlap"), -600.f, 350.f);
+
+    UK2Node_CallFunction* GetPlayer = AddCall(UGameplayStatics::StaticClass(), TEXT("GetPlayerCharacter"), -200.f, 80.f);
+    UK2Node_CallFunction* GetComp = AddCall(AActor::StaticClass(), TEXT("GetComponentByClass"), 80.f, 80.f);
+    SetClassDefault(GetComp, TEXT("ComponentClass"), UCharacterMovementComponent::StaticClass());
+
+    UK2Node_DynamicCast* CastCMC = NewObject<UK2Node_DynamicCast>(EventGraph);
+    CastCMC->TargetType = UCharacterMovementComponent::StaticClass();
+    CastCMC->NodePosX = 360;
+    CastCMC->NodePosY = 40;
+    EventGraph->AddNode(CastCMC);
+    CastCMC->CreateNewGuid();
+    CastCMC->PostPlacedNewNode();
+    CastCMC->AllocateDefaultPins();
+    CastCMC->SetPurity(true);
+    CastCMC->ReconstructNode();
+
+    UK2Node_CallFunction* ActOff = AddCall(UActorComponent::StaticClass(), TEXT("SetActive"), 620.f, 0.f);
+    UK2Node_CallFunction* PrintIn = AddCall(UKismetSystemLibrary::StaticClass(), TEXT("PrintString"), 900.f, 0.f);
+    SetDefault(ActOff, TEXT("bNewActive"), TEXT("false"));
+    SetDefault(PrintIn, TEXT("InString"), TEXT("entrar"));
+    UK2Node_VariableSet* Grav0 = AddVarSet(TEXT("GravityScale"), TEXT("0.0"), 1180.f, 0.f);
+    UK2Node_VariableSet* Air1 = AddVarSet(TEXT("AirControl"), TEXT("1.0"), 1460.f, 0.f);
+
+    UK2Node_CallFunction* ActOn = AddCall(UActorComponent::StaticClass(), TEXT("SetActive"), 620.f, 320.f);
+    UK2Node_CallFunction* PrintOut = AddCall(UKismetSystemLibrary::StaticClass(), TEXT("PrintString"), 900.f, 320.f);
+    SetDefault(ActOn, TEXT("bNewActive"), TEXT("true"));
+    SetDefault(PrintOut, TEXT("InString"), TEXT("salir"));
+    UK2Node_VariableSet* Grav1 = AddVarSet(TEXT("GravityScale"), TEXT("1.0"), 1180.f, 320.f);
+    UK2Node_VariableSet* AirOut = AddVarSet(TEXT("AirControl"), TEXT("0.05"), 1460.f, 320.f);
+
+    UK2Node_Self* SelfNode = FUnrealMCPCommonUtils::CreateSelfReferenceNode(EventGraph, FVector2D(-200.f, 760.f));
+    UK2Node_CallFunction* IsOverlap = AddCall(AActor::StaticClass(), TEXT("IsOverlappingActor"), 40.f, 760.f);
+    UK2Node_CallFunction* SelOverlap = AddCall(UKismetMathLibrary::StaticClass(), TEXT("SelectFloat"), 320.f, 760.f);
+    SetDefault(SelOverlap, TEXT("A"), TEXT("1.0"));
+    SetDefault(SelOverlap, TEXT("B"), TEXT("0.0"));
+
+    UK2Node_CallFunction* GetPC = AddCall(UGameplayStatics::StaticClass(), TEXT("GetPlayerController"), -200.f, 980.f);
+    UK2Node_CallFunction* KeyW = AddCall(APlayerController::StaticClass(), TEXT("IsInputKeyDown"), 80.f, 940.f);
+    UK2Node_CallFunction* KeyS = AddCall(APlayerController::StaticClass(), TEXT("IsInputKeyDown"), 80.f, 1100.f);
+    SetDefault(KeyW, TEXT("Key"), TEXT("W"));
+    SetDefault(KeyS, TEXT("Key"), TEXT("S"));
+    UK2Node_CallFunction* SelW = AddCall(UKismetMathLibrary::StaticClass(), TEXT("SelectFloat"), 320.f, 940.f);
+    UK2Node_CallFunction* SelS = AddCall(UKismetMathLibrary::StaticClass(), TEXT("SelectFloat"), 320.f, 1100.f);
+    SetDefault(SelW, TEXT("A"), TEXT("1.0"));
+    SetDefault(SelW, TEXT("B"), TEXT("0.0"));
+    SetDefault(SelS, TEXT("A"), TEXT("-1.0"));
+    SetDefault(SelS, TEXT("B"), TEXT("0.0"));
+
+    UK2Node_CallFunction* AddWS = AddCall(UKismetMathLibrary::StaticClass(), TEXT("Add_DoubleDouble"), 560.f, 1000.f);
+    UK2Node_CallFunction* MulOv = AddCall(UKismetMathLibrary::StaticClass(), TEXT("Multiply_DoubleDouble"), 780.f, 860.f);
+    UK2Node_CallFunction* MulSpd = AddCall(UKismetMathLibrary::StaticClass(), TEXT("Multiply_DoubleDouble"), 1000.f, 860.f);
+    UK2Node_CallFunction* MulDt = AddCall(UKismetMathLibrary::StaticClass(), TEXT("Multiply_DoubleDouble"), 1220.f, 860.f);
+    SetDefault(MulSpd, TEXT("B"), TEXT("250.0"));
+
+    UK2Node_CallFunction* GetUp = AddCall(AActor::StaticClass(), TEXT("GetActorUpVector"), 1440.f, 980.f);
+    UK2Node_CallFunction* MulVec = AddCall(UKismetMathLibrary::StaticClass(), TEXT("Multiply_VectorFloat"), 1660.f, 860.f);
+    if (!MulVec)
+    {
+        MulVec = AddCall(UKismetMathLibrary::StaticClass(), TEXT("Multiply_VectorDouble"), 1660.f, 860.f);
+    }
+
+    UK2Node_CallFunction* AddOffset = AddCall(AActor::StaticClass(), TEXT("K2_AddActorWorldOffset"), 1900.f, 700.f);
+    SetDefault(AddOffset, TEXT("bSweep"), TEXT("false"));
+    SetDefault(AddOffset, TEXT("bTeleport"), TEXT("true"));
+
+    if (!BeginOverlap || !Tick || !EndOverlap || !GetPlayer || !GetComp || !CastCMC
+        || !ActOff || !PrintIn || !Grav0 || !Air1 || !ActOn || !PrintOut || !Grav1 || !AirOut
+        || !SelfNode || !IsOverlap || !SelOverlap || !GetPC || !KeyW || !KeyS || !SelW || !SelS || !AddWS
+        || !MulOv || !MulSpd || !MulDt || !GetUp || !MulVec || !AddOffset)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("setup_climb_zone: failed to create one or more nodes"));
+    }
+
+    auto AsCMC = TEXT("AsCharacter Movement Component");
+
+    Link(BeginOverlap, TEXT("then"), ActOff, TEXT("execute"));
+    Link(GetPlayer, TEXT("ReturnValue"), GetComp, TEXT("self"));
+    Link(GetComp, TEXT("ReturnValue"), CastCMC, TEXT("Object"));
+    Link(CastCMC, AsCMC, ActOff, TEXT("self"));
+    Link(ActOff, TEXT("then"), PrintIn, TEXT("execute"));
+    Link(PrintIn, TEXT("then"), Grav0, TEXT("execute"));
+    Link(CastCMC, AsCMC, Grav0, TEXT("self"));
+    Link(Grav0, TEXT("then"), Air1, TEXT("execute"));
+    Link(CastCMC, AsCMC, Air1, TEXT("self"));
+
+    Link(EndOverlap, TEXT("then"), ActOn, TEXT("execute"));
+    Link(CastCMC, AsCMC, ActOn, TEXT("self"));
+    Link(ActOn, TEXT("then"), PrintOut, TEXT("execute"));
+    Link(PrintOut, TEXT("then"), Grav1, TEXT("execute"));
+    Link(CastCMC, AsCMC, Grav1, TEXT("self"));
+    Link(Grav1, TEXT("then"), AirOut, TEXT("execute"));
+    Link(CastCMC, AsCMC, AirOut, TEXT("self"));
+
+    Link(Tick, TEXT("then"), AddOffset, TEXT("execute"));
+    Link(SelfNode, TEXT("self"), IsOverlap, TEXT("self"));
+    Link(GetPlayer, TEXT("ReturnValue"), IsOverlap, TEXT("Other"));
+    Link(IsOverlap, TEXT("ReturnValue"), SelOverlap, TEXT("bPickA"));
+    Link(GetPC, TEXT("ReturnValue"), KeyW, TEXT("self"));
+    Link(GetPC, TEXT("ReturnValue"), KeyS, TEXT("self"));
+    Link(KeyW, TEXT("ReturnValue"), SelW, TEXT("bPickA"));
+    Link(KeyS, TEXT("ReturnValue"), SelS, TEXT("bPickA"));
+    Link(SelW, TEXT("ReturnValue"), AddWS, TEXT("A"));
+    Link(SelS, TEXT("ReturnValue"), AddWS, TEXT("B"));
+    Link(AddWS, TEXT("ReturnValue"), MulOv, TEXT("A"));
+    Link(SelOverlap, TEXT("ReturnValue"), MulOv, TEXT("B"));
+    Link(MulOv, TEXT("ReturnValue"), MulSpd, TEXT("A"));
+    Link(MulSpd, TEXT("ReturnValue"), MulDt, TEXT("A"));
+    Link(Tick, TEXT("DeltaSeconds"), MulDt, TEXT("B"));
+    Link(SelfNode, TEXT("self"), GetUp, TEXT("self"));
+    Link(GetUp, TEXT("ReturnValue"), MulVec, TEXT("A"));
+    Link(MulDt, TEXT("ReturnValue"), MulVec, TEXT("B"));
+    Link(MulVec, TEXT("ReturnValue"), AddOffset, TEXT("DeltaLocation"));
+    Link(GetPlayer, TEXT("ReturnValue"), AddOffset, TEXT("self"));
+
+    for (UEdGraphNode* Node : EventGraph->Nodes)
+    {
+        if (!Node)
+        {
+            continue;
+        }
+        for (UEdGraphPin* Pin : Node->Pins)
+        {
+            if (Pin && Pin->LinkedTo.Num() > 0)
+            {
+                Node->PinConnectionListChanged(Pin);
+            }
+        }
+    }
+
+    if (UClass* Gen = Blueprint->GeneratedClass)
+    {
+        if (AActor* CDO = Cast<AActor>(Gen->GetDefaultObject()))
+        {
+            CDO->SetActorTickEnabled(true);
+            CDO->PrimaryActorTick.bCanEverTick = true;
+            CDO->PrimaryActorTick.bStartWithTickEnabled = true;
+            if (UBoxComponent* Box = CDO->FindComponentByClass<UBoxComponent>())
+            {
+                Box->SetBoxExtent(FVector(80.f, 50.f, 280.f));
+                Box->SetCollisionEnabled(ECollisionEnabled::QueryOnly);
+                Box->SetCollisionProfileName(TEXT("OverlapOnlyPawn"));
+                Box->SetGenerateOverlapEvents(true);
+                Box->SetHiddenInGame(false);
+                Box->CanCharacterStepUpOn = ECB_No;
+            }
+        }
+    }
+
+    FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+    FKismetEditorUtilities::CompileBlueprint(Blueprint);
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetBoolField(TEXT("success"), true);
+    Result->SetStringField(TEXT("blueprint_name"), BlueprintName);
+    Result->SetStringField(TEXT("note"), TEXT("SIMPLE overlap W/S climb v2"));
+    return Result;
+}
+
+TSharedPtr<FJsonObject> HandleSetupClimbZone(const TSharedPtr<FJsonObject>& Params)
+{
+    return HandleSetupSimpleClimb(Params);
+}
+
 }  // anonymous namespace
 
 
@@ -898,3 +1282,4 @@ REGISTER_MCP_COMMAND("add_blueprint_variable", &HandleAddBlueprintVariable);
 REGISTER_MCP_COMMAND("add_blueprint_input_action_node", &HandleAddBlueprintInputActionNode);
 REGISTER_MCP_COMMAND("add_blueprint_self_reference", &HandleAddBlueprintSelfReference);
 REGISTER_MCP_COMMAND("find_blueprint_nodes", &HandleFindBlueprintNodes);
+REGISTER_MCP_COMMAND("setup_climb_zone", &HandleSetupClimbZone);

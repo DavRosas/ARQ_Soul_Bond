@@ -4,6 +4,8 @@
 #include "Engine/BlueprintGeneratedClass.h"
 #include "Factories/BlueprintFactory.h"
 #include "EdGraphSchema_K2.h"
+#include "EdGraph/EdGraph.h"
+#include "EdGraph/EdGraphPin.h"
 #include "K2Node_Event.h"
 #include "K2Node_VariableGet.h"
 #include "K2Node_VariableSet.h"
@@ -799,6 +801,25 @@ TSharedPtr<FJsonObject> HandleCompileBlueprint(const TSharedPtr<FJsonObject>& Pa
     if (!Blueprint)
     {
         return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Blueprint not found: %s"), *BlueprintName));
+    }
+
+    // MakeLinkTo does not notify wildcard pins; force type implication before compile.
+    if (UEdGraph* EventGraph = FUnrealMCPCommonUtils::FindOrCreateEventGraph(Blueprint))
+    {
+        for (UEdGraphNode* Node : EventGraph->Nodes)
+        {
+            if (!Node)
+            {
+                continue;
+            }
+            for (UEdGraphPin* Pin : Node->Pins)
+            {
+                if (Pin && Pin->LinkedTo.Num() > 0)
+                {
+                    Node->PinConnectionListChanged(Pin);
+                }
+            }
+        }
     }
 
     // Compile the blueprint
