@@ -78,6 +78,9 @@ DerivedDataCache/*
 Developers/
 Content/Developers/
 
+# Copias locales de umaps en conflicto (no subir)
+_merge_backups/
+
 # OS and editor temp files
 Thumbs.db
 ehthumbs.db
