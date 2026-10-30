@@ -1,0 +1,17 @@
+# Los binarios de Unreal y las fuentes no deben cambiar de fin de linea al clonar.
+*.uasset binary
+*.umap binary
+*.ubulk binary
+*.uexp binary
+*.ufont binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.tga binary
+*.bmp binary
+*.wav binary
+*.mp3 binary
+*.ogg binary
+*.fbx binary
+*.ttf binary
+*.otf binary
