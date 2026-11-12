@@ -12,6 +12,7 @@
 *.wav binary
 *.mp3 binary
 *.ogg binary
+*.mp4 binary
 *.fbx binary
 *.ttf binary
 *.otf binary
