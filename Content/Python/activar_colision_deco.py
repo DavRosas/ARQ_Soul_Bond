@@ -1,6 +1,6 @@
 import unreal
 
-CARPETA = "Deco_Collision"
+CARPETAS = ("Deco_Collision", "Deco_Colision")
 
 subsistema = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
 actores = subsistema.get_all_level_actors()
@@ -8,10 +8,15 @@ actores = subsistema.get_all_level_actors()
 cambiados = []
 sin_componente = []
 
+def en_carpeta(ruta):
+    for carpeta in CARPETAS:
+        if ruta == carpeta or ruta.startswith(carpeta + "/"):
+            return True
+    return False
+
 with unreal.ScopedEditorTransaction("Activar colision en Deco_Collision"):
     for actor in actores:
-        carpeta = str(actor.get_folder_path())
-        if carpeta != CARPETA and not carpeta.startswith(CARPETA + "/"):
+        if not en_carpeta(str(actor.get_folder_path())):
             continue
 
         actor.set_actor_enable_collision(True)
@@ -26,7 +31,7 @@ with unreal.ScopedEditorTransaction("Activar colision en Deco_Collision"):
 
         cambiados.append(actor.get_actor_label())
 
-unreal.log_warning("Colision activada en %d actores de %s" % (len(cambiados), CARPETA))
+unreal.log_warning("Colision activada en %d actores" % len(cambiados))
 for nombre in cambiados:
     unreal.log("  " + nombre)
 if sin_componente:
